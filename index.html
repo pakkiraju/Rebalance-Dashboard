@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rebalance Dashboard</title>
+  <link rel="stylesheet" href="./style.css">
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+
+  <!-- ===== UPLOAD SCREEN ===== -->
+  <div id="upload-screen">
+    <div class="upload-logo">Instinet <span>Rebalance</span></div>
+    <div class="upload-subtitle">MSCI &amp; S&amp;P Net Flows Dashboard</div>
+    <div class="upload-zone" id="upload-zone">
+      <div class="upload-icon">&#x1F4C1;</div>
+      <div class="upload-text">Drop 1 or 2 rebalance XLSX files here</div>
+      <div class="upload-hint">S&amp;P: combine net-flows + share-change file for full names &amp; events &bull; MSCI: single file &bull; .xlsx</div>
+      <input type="file" id="file-input" accept=".xlsx,.xls" multiple style="display:none;">
+    </div>
+  </div>
+
+  <!-- ===== LOADING OVERLAY ===== -->
+  <div class="loading-overlay" id="loading-overlay">
+    <div class="spinner"></div>
+    <div class="loading-text">PARSING REBALANCE DATA</div>
+    <div class="loading-format" id="loading-format" style="font-family:var(--font-mono);font-size:0.7rem;color:var(--text-muted);margin-top:0.3rem;"></div>
+    <div class="loading-progress" id="loading-progress">Reading workbook...</div>
+  </div>
+
+  <!-- ===== DASHBOARD ===== -->
+  <div id="dashboard">
+    <!-- Sidebar -->
+    <nav class="sidebar">
+      <div class="sidebar-logo">MSCI <span>Rebalance</span></div>
+      <div class="sidebar-date" id="sidebar-date">--</div>
+      <ul class="sidebar-nav">
+        <li><a href="#overview" class="active" data-tab="overview"><span class="nav-icon">&#9670;</span> Overview</a></li>
+        <li><a href="#allnames" data-tab="allnames"><span class="nav-icon">&#9783;</span> All Names</a></li>
+        <li><a href="#topmovers" data-tab="topmovers"><span class="nav-icon">&#9650;</span> Top Movers</a></li>
+        <li><a href="#comparison" data-tab="comparison"><span class="nav-icon">&#8644;</span> Comparison</a></li>
+        <li><a href="#vlookup" data-tab="vlookup"><span class="nav-icon">&#128270;</span> V-Lookup</a></li>
+        <li><a href="#analytics" data-tab="analytics"><span class="nav-icon">&#9881;</span> Analytics</a></li>
+      </ul>
+      <div class="sidebar-info">
+        <span class="info-modal-btn" id="open-key-modal">&#9432; Flow Definitions</span>
+      </div>
+    </nav>
+
+    <!-- Main Content -->
+    <div class="main-content">
+
+      <!-- ===== OVERVIEW TAB ===== -->
+      <div class="tab-content active" id="tab-overview">
+        <div class="page-header">
+          <div class="page-title">Overview</div>
+          <div class="page-badge" id="overview-badge">REBALANCE DAY</div>
+        </div>
+        <div class="top-banner" id="top-banner"></div>
+        <div class="summary-grid" id="summary-cards"></div>
+        <div class="section-card">
+          <div class="section-header"><div class="section-title">Flow Breakdown by Index Type</div></div>
+          <div class="section-body" id="flow-breakdown-body"></div>
+        </div>
+        <div class="chart-row">
+          <div class="section-card">
+            <div class="section-header"><div class="section-title">Industry Net Flows (USD MM)</div></div>
+            <div class="section-body"><div class="chart-container"><canvas id="chart-industry-net"></canvas></div></div>
+          </div>
+          <div class="section-card">
+            <div class="section-header"><div class="section-title">Industry Two-Way Flows (USD MM)</div></div>
+            <div class="section-body"><div class="chart-container"><canvas id="chart-industry-twoway"></canvas></div></div>
+          </div>
+        </div>
+        <div class="section-card">
+          <div class="section-header"><div class="section-title">Country Distribution</div></div>
+          <div class="section-body">
+            <div class="donut-container">
+              <div class="donut-chart-wrap"><canvas id="chart-country-donut"></canvas></div>
+              <div class="donut-legend" id="country-legend"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== ALL NAMES TAB ===== -->
+      <div class="tab-content" id="tab-allnames">
+        <div class="page-header">
+          <div class="page-title">All Names</div>
+          <div class="page-badge" id="allnames-count">0 STOCKS</div>
+        </div>
+        <div class="filters-bar" id="allnames-filters"></div>
+        <div class="section-card">
+          <div class="data-table-wrap" style="max-height:65vh; overflow-y:auto;">
+            <table class="data-table" id="allnames-table">
+              <thead id="allnames-thead"></thead>
+              <tbody id="allnames-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="pagination" id="allnames-pagination"></div>
+      </div>
+
+      <!-- ===== TOP MOVERS TAB ===== -->
+      <div class="tab-content" id="tab-topmovers">
+        <div class="page-header">
+          <div class="page-title">Top Movers</div>
+          <div class="page-badge">TOP NAMES</div>
+        </div>
+        <div class="movers-grid" id="topmovers-grid"></div>
+      </div>
+
+      <!-- ===== COMPARISON TAB ===== -->
+      <div class="tab-content" id="tab-comparison">
+        <div class="page-header">
+          <div class="page-title">Comparison</div>
+          <div class="page-badge">VS PRIOR REBALANCE</div>
+        </div>
+        <div class="filters-bar" id="comparison-filters"></div>
+        <div class="section-card">
+          <div class="data-table-wrap" style="max-height:65vh; overflow-y:auto;">
+            <table class="data-table" id="comparison-table">
+              <thead id="comparison-thead"></thead>
+              <tbody id="comparison-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="pagination" id="comparison-pagination"></div>
+      </div>
+
+      <!-- ===== V-LOOKUP TAB ===== -->
+      <div class="tab-content" id="tab-vlookup">
+        <div class="page-header">
+          <div class="page-title">V-Lookup</div>
+          <div class="page-badge">SYMBOL SEARCH</div>
+        </div>
+        <div class="vlookup-inputs" id="vlookup-inputs"></div>
+        <div class="section-card" id="vlookup-table-section" style="display:none;">
+          <div class="section-header"><div class="section-title">Results</div><div class="page-badge" id="vlookup-count"></div></div>
+          <div class="section-body">
+            <div class="data-table-wrap">
+              <table class="data-table" id="vlookup-results-table">
+                <thead id="vlookup-thead"></thead>
+                <tbody id="vlookup-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== ANALYTICS TAB ===== -->
+      <div class="tab-content" id="tab-analytics">
+        <div class="page-header">
+          <div class="page-title">Analytics</div>
+          <div class="page-badge">COMPUTED METRICS</div>
+        </div>
+        <div class="analytics-grid" id="analytics-top"></div>
+        <div class="chart-row" id="analytics-charts-row"></div>
+        <div class="section-card" id="analytics-heatmap-section">
+          <div class="section-header"><div class="section-title">Industry x Country Heatmap (Net Flow)</div></div>
+          <div class="section-body" id="analytics-heatmap-body" style="overflow-x:auto;"></div>
+        </div>
+        <div class="analytics-grid" id="analytics-bottom"></div>
+      </div>
+
+    </div><!-- /main-content -->
+  </div><!-- /dashboard -->
+
+  <!-- ===== KEY MODAL ===== -->
+  <div class="modal-overlay" id="key-modal">
+    <div class="modal-box">
+      <button class="modal-close" id="close-key-modal">&times;</button>
+      <div class="modal-title">Flow Measure Definitions</div>
+      <div class="modal-body">
+        <h3>Net Flow</h3>
+        <p>Buys minus Sells. Shows the directional pressure. Positive = net buying, Negative = net selling.</p>
+        <h3>Simple Gross Flow</h3>
+        <p>Buys plus Sells. Shows total two-way activity regardless of direction.</p>
+        <h3>Gross Ex-Crossing Flow</h3>
+        <p>Maximum of Buys and Sells. Represents the flow that cannot be crossed internally and must hit the market. This is the most relevant measure for estimating market impact.</p>
+        <p style="margin-top:1rem; color: var(--text-muted);">Example: If AAPL has $500M buys and $300M sells, then Net = +$200M, Simple Gross = $800M, Gross Ex-Crossing = $500M.</p>
+      </div>
+    </div>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>

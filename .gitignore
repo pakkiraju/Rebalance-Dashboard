@@ -1,0 +1,7 @@
+# Local / client data
+*.xlsx
+*.xls
+
+# OS
+.DS_Store
+Thumbs.db
