@@ -520,6 +520,16 @@ a:hover { text-decoration: underline; }
 
 .filter-input { min-width: 200px; }
 .filter-select { min-width: 140px; }
+.filter-select--wide { min-width: 200px; max-width: 320px; }
+
+.comparison-hint {
+  margin: 0 0 0.5rem 0;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  max-width: 56rem;
+}
+.comparison-hint strong { color: var(--text-primary); font-weight: 600; }
 
 .filter-btn {
   font-family: var(--font-mono);

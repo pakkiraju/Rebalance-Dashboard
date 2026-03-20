@@ -16,7 +16,7 @@ const STATE = {
   allTickers: [],   // For autocomplete
   mergeNote: '',    // e.g. dual S&P file merge description
   // Filters / sort / pagination
-  allNamesFilter: { search: '', country: 'all', industry: 'all', direction: 'all', index: 'all' },
+  allNamesFilter: { search: '', country: 'all', industry: 'all', direction: 'all', index: 'all', event: 'all' },
   allNamesSort: { col: null, dir: 'asc' },
   allNamesPage: 1,
   compFilter: { search: '', direction: 'all' },
@@ -27,6 +27,55 @@ const STATE = {
 };
 
 const PER_PAGE = 50;
+
+/** Split "S&P 500, S&P 400" into separate index tokens for aggregation. */
+function splitIndexTokens(indexStr) {
+  if (!indexStr || !String(indexStr).trim()) return [];
+  return String(indexStr).split(',').map(s => s.trim()).filter(Boolean);
+}
+
+/**
+ * Aggregate S&P/TSX overall rows by index label.
+ * Comma-separated index fields split value/count across parts so each index gets a fair share.
+ */
+function aggregateSpOverallByIndex(overall) {
+  const by = {};
+  for (const d of overall) {
+    const parts = splitIndexTokens(d.index);
+    const keys = parts.length ? parts : ['(no index)'];
+    const n = keys.length;
+    for (const idx of keys) {
+      if (!by[idx]) by[idx] = { buys: 0, sells: 0, buyVal: 0, sellVal: 0 };
+      if (d.direction === 'BUY') {
+        by[idx].buys += 1 / n;
+        by[idx].buyVal += pn(d.netValue) / n;
+      } else {
+        by[idx].sells += 1 / n;
+        by[idx].sellVal += Math.abs(pn(d.netValue)) / n;
+      }
+    }
+  }
+  return by;
+}
+
+function uniqueSortedEventTypes(overall) {
+  const s = new Set();
+  overall.forEach(d => s.add(d.eventType || ''));
+  return [...s].sort((a, b) => (a || '\uFFFF').localeCompare(b || '\uFFFF'));
+}
+
+function escapeAttr(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
+function buildEventFilterOptions(overall) {
+  const events = uniqueSortedEventTypes(overall);
+  return events.map(e => {
+    const val = e === '' ? '__none__' : e;
+    const label = e === '' ? 'No event' : e;
+    return `<option value="${escapeAttr(val)}">${escapeAttr(label)}</option>`;
+  }).join('');
+}
 
 // ============================================================
 // S&P CHANGE → EVENT TYPE MAPPING
@@ -125,6 +174,17 @@ function detectFormat(wb) {
   const ws = wb.Sheets[sheetName];
   const json = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
 
+  let blob = '';
+  for (let i = 0; i < Math.min(28, json.length); i++) {
+    const row = json[i];
+    if (!row) continue;
+    blob += row.map(c => String(c).toUpperCase()).join('|') + '\n';
+  }
+  // S&P/TSX (and similar) use Sedol like MSCI — must classify as S&P before the generic SEDOL → MSCI rule
+  if (blob.includes('S&P/TSX') || blob.includes('S&P /TSX') || /\bTSX\s+60\b/.test(blob) || /\bS&P\/TSX\s+COMPOSITE\b/i.test(blob)) {
+    return 'sp';
+  }
+
   for (let i = 0; i < Math.min(20, json.length); i++) {
     const row = json[i];
     if (!row) continue;
@@ -219,14 +279,10 @@ document.addEventListener('DOMContentLoaded', () => {
   };
 
   async function handleFiles(fileList) {
-    let files = Array.from(fileList || []).filter(f => f.name.match(/\.xlsx?$/i));
+    const files = Array.from(fileList || []).filter(f => f.name.match(/\.xlsx?$/i));
     if (!files.length) {
-      alert('Please choose one or two .xlsx files');
+      alert('Please choose one or more .xlsx files');
       return;
-    }
-    if (files.length > 2) {
-      alert('More than two files selected; using the first two.');
-      files = files.slice(0, 2);
     }
 
     overlay.classList.add('active');
@@ -242,6 +298,7 @@ document.addEventListener('DOMContentLoaded', () => {
         progress.textContent = 'Detecting format...';
         STATE.format = detectFormat(wb);
         STATE.mergeNote = '';
+        STATE.allNamesFilter = { search: '', country: 'all', industry: 'all', direction: 'all', index: 'all', event: 'all' };
         if (loadingFormat) loadingFormat.textContent = STATE.format === 'sp' ? 'S&P' : 'MSCI';
 
         progress.textContent = 'Extracting Overall sheet...';
@@ -258,22 +315,29 @@ document.addEventListener('DOMContentLoaded', () => {
           parseComparison(wb);
         }
       } else {
-        progress.textContent = 'Reading two workbooks...';
-        const [d1, d2] = await Promise.all([
-          readFileAsArrayBuffer(files[0]),
-          readFileAsArrayBuffer(files[1])
-        ]);
+        progress.textContent = `Reading ${files.length} workbooks...`;
+        const buffers = await Promise.all(files.map(readFileAsArrayBuffer));
         progress.textContent = 'Parsing workbooks...';
-        const wb1 = XLSX.read(d1, { type: 'array', cellDates: true });
-        const wb2 = XLSX.read(d2, { type: 'array', cellDates: true });
-
-        if (loadingFormat) loadingFormat.textContent = 'S&P · dual workbook';
-        progress.textContent = 'Merging S&P data...';
-        if (!loadDualWorkbooks(wb1, wb2)) {
+        const wbs = buffers.map(b => XLSX.read(b, { type: 'array', cellDates: true }));
+        const formats = wbs.map(detectFormat);
+        const fmt0 = formats[0];
+        if (!formats.every(f => f === fmt0)) {
+          alert('All files in one upload must be the same type (all MSCI or all S&P).');
           overlay.classList.remove('active');
           return;
         }
-        STATE.comparison = [];
+
+        STATE.mergeNote = '';
+        STATE.allNamesFilter = { search: '', country: 'all', industry: 'all', direction: 'all', index: 'all', event: 'all' };
+        if (loadingFormat) loadingFormat.textContent = `${fmt0 === 'sp' ? 'S&P' : 'MSCI'} · ${files.length} files`;
+
+        progress.textContent = 'Merging workbooks...';
+        if (fmt0 === 'sp') {
+          loadManySpWorkbooks(wbs);
+          STATE.comparison = [];
+        } else {
+          loadManyMsciWorkbooks(wbs);
+        }
       }
 
       progress.textContent = 'Building dashboard...';
@@ -323,8 +387,10 @@ function parseOverall(wb) {
   }
 }
 
-function parseOverallMSCI(json) {
-  // Find header row (row 10 = index 9)
+function parseOverallMSCIToBucket(json, bucket) {
+  bucket.overall = [];
+  bucket.allTickers = [];
+
   let headerIdx = -1;
   for (let i = 7; i < Math.min(15, json.length); i++) {
     const row = json[i];
@@ -333,7 +399,7 @@ function parseOverallMSCI(json) {
       break;
     }
   }
-  if (headerIdx === -1) headerIdx = 9; // fallback
+  if (headerIdx === -1) headerIdx = 9;
 
   const headers = json[headerIdx].map(h => safeStr(h).toUpperCase());
 
@@ -357,9 +423,6 @@ function parseOverallMSCI(json) {
     industry: findCol(['INDUSTRY']),
     effectiveDate: findCol(['EFFECTIVE'])
   };
-
-  STATE.overall = [];
-  STATE.allTickers = [];
 
   for (let i = headerIdx + 1; i < json.length; i++) {
     const row = json[i];
@@ -393,24 +456,31 @@ function parseOverallMSCI(json) {
       direction: netVal >= 0 ? 'BUY' : 'SELL'
     };
 
-    // Effective date
-    if (!STATE.effectiveDate && colMap.effectiveDate >= 0 && row[colMap.effectiveDate]) {
+    if (!bucket.effectiveDate && colMap.effectiveDate >= 0 && row[colMap.effectiveDate]) {
       const d = row[colMap.effectiveDate];
       if (d instanceof Date) {
-        STATE.effectiveDate = d.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+        bucket.effectiveDate = d.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
       } else {
-        STATE.effectiveDate = safeStr(d);
+        bucket.effectiveDate = safeStr(d);
       }
     }
 
-    STATE.overall.push(item);
-    STATE.allTickers.push({ ticker: cleanTicker, fullTicker: ticker, issuer, country });
+    bucket.overall.push(item);
+    bucket.allTickers.push({ ticker: cleanTicker, fullTicker: ticker, issuer, country });
   }
+}
+
+function parseOverallMSCI(json) {
+  const bucket = { overall: [], allTickers: [], effectiveDate: STATE.effectiveDate || '' };
+  parseOverallMSCIToBucket(json, bucket);
+  STATE.overall = bucket.overall;
+  STATE.allTickers = bucket.allTickers;
+  if (bucket.effectiveDate) STATE.effectiveDate = bucket.effectiveDate;
 }
 
 /**
  * Parse S&P Overall into a bucket (used for single file or dual-file merge).
- * variant: 'standard' (CUSIP + CHANGE) or 'netflows' (ISSUER/COUNTRY, no event column).
+ * variant: 'standard' (CUSIP + CHANGE), 'netflows' (ISSUER/COUNTRY), 'tsx' (S&P/TSX: TICKER + Sedol + Name, no CUSIP).
  */
 function parseOverallSPInto(json, bucket) {
   bucket.overall = [];
@@ -439,6 +509,7 @@ function parseOverallSPInto(json, bucket) {
     const hasT = rowUpper.some(c => c.includes('TICKER'));
     const hasC = rowUpper.some(c => c.includes('CUSIP'));
     const hasIss = rowUpper.some(c => c.includes('ISSUER'));
+    const hasSedol = rowUpper.some(c => c.includes('SEDOL'));
     if (hasT && hasC) {
       headerIdx = i;
       variant = 'standard';
@@ -447,6 +518,11 @@ function parseOverallSPInto(json, bucket) {
     if (hasT && hasIss && !hasC) {
       headerIdx = i;
       variant = 'netflows';
+      break;
+    }
+    if (hasT && hasSedol && !hasC && !hasIss) {
+      headerIdx = i;
+      variant = 'tsx';
       break;
     }
   }
@@ -515,6 +591,65 @@ function parseOverallSPInto(json, bucket) {
 
       bucket.overall.push(item);
       bucket.allTickers.push({ ticker, fullTicker: ticker, issuer: name, country: '' });
+    }
+    return;
+  }
+
+  if (variant === 'tsx') {
+    const colMap = {
+      ticker: findCol(['TICKER']),
+      sedol: findCol(['SEDOL']),
+      name: findCol(['NAME']),
+      industry: findCol(['INDUSTRY']),
+      index: findCol(['TSX', 'INDEX']) >= 0 ? findCol(['TSX', 'INDEX']) : findCol(['S&P', 'TSX']),
+      price: findCol(['CAD', 'PRICE']) >= 0 ? findCol(['CAD', 'PRICE']) : findCol(['PRICE']),
+      netValue: findCol(['NET', 'TOTAL', 'TRADE']) >= 0 ? findCol(['NET', 'TOTAL', 'TRADE'])
+        : (findCol(['NET', 'TOTAL', 'VALUE']) >= 0 ? findCol(['NET', 'TOTAL', 'VALUE']) : findCol(['NET', 'VALUE'])),
+      netShares: findCol(['NET', 'SHARES']),
+      avgVol: findCol(['20D']) >= 0 ? findCol(['20D']) : findCol(['AVG', 'VOL']),
+      liquidity: findCol(['LIQUIDITY'])
+    };
+
+    for (let i = headerIdx + 1; i < json.length; i++) {
+      const row = json[i];
+      if (!row) continue;
+
+      const ticker = safeStr(row[colMap.ticker]);
+      if (!ticker || ticker.toUpperCase() === 'TICKER') continue;
+
+      const sedol = colMap.sedol >= 0 ? safeStr(row[colMap.sedol]) : '';
+      const name = colMap.name >= 0 ? safeStr(row[colMap.name]) : '';
+      const nvCol = colMap.netValue;
+      const netVal = nvCol >= 0 ? pn(row[nvCol]) : 0;
+
+      let cleanTicker = ticker.split(' ')[0] || ticker;
+      const exchange = ticker.split(' ').slice(1).join(' ') || '';
+
+      const item = {
+        sedol,
+        ticker,
+        cleanTicker,
+        exchange,
+        issuer: name,
+        country: 'CA',
+        index: colMap.index >= 0 ? safeStr(row[colMap.index]) : '',
+        cusip: '',
+        avgVol: colMap.avgVol >= 0 ? pn(row[colMap.avgVol]) : 0,
+        price: colMap.price >= 0 ? pn(row[colMap.price]) : 0,
+        netShares: colMap.netShares >= 0 ? pn(row[colMap.netShares]) : 0,
+        netValue: netVal,
+        netLiq: colMap.liquidity >= 0 ? pn(row[colMap.liquidity]) : 0,
+        grossShares: 0,
+        grossValue: 0,
+        grossLiq: 0,
+        absLiq: Math.abs(colMap.liquidity >= 0 ? pn(row[colMap.liquidity]) : 0),
+        industry: colMap.industry >= 0 ? safeStr(row[colMap.industry]) : '',
+        direction: netVal >= 0 ? 'BUY' : 'SELL',
+        eventType: ''
+      };
+
+      bucket.overall.push(item);
+      bucket.allTickers.push({ ticker: cleanTicker, fullTicker: ticker, issuer: name, country: 'CA' });
     }
     return;
   }
@@ -597,35 +732,6 @@ function spOverallBundleFromWorkbook(wb) {
   return bucket;
 }
 
-/** Merge S&P net-flows list (larger) with standard share-change file (event + CUSIP). Order-independent. */
-function mergeSpDualBundles(flowsBundle, changeBundle) {
-  const byTicker = new Map();
-  for (const row of changeBundle.overall) {
-    const k = row.cleanTicker.toUpperCase();
-    if (!byTicker.has(k)) byTicker.set(k, row);
-    if (row.cusip) byTicker.set('_' + row.cusip, row);
-  }
-
-  for (const row of flowsBundle.overall) {
-    const k = row.cleanTicker.toUpperCase();
-    const src = byTicker.get(k) || (row.cusip && byTicker.get('_' + row.cusip));
-    if (!src || !src.eventType) continue;
-    row.eventType = src.eventType;
-    if (!row.index && src.index) row.index = src.index;
-    if (!row.cusip && src.cusip) row.cusip = src.cusip;
-  }
-
-  STATE.overall = flowsBundle.overall;
-  STATE.allTickers = flowsBundle.overall.map(d => ({
-    ticker: d.cleanTicker,
-    fullTicker: d.ticker,
-    issuer: d.issuer,
-    country: d.country || ''
-  }));
-  STATE.title = flowsBundle.title || changeBundle.title || STATE.title;
-  STATE.effectiveDate = flowsBundle.effectiveDate || changeBundle.effectiveDate || STATE.effectiveDate;
-}
-
 function scoreSpSummary(summary) {
   const stats = summary.spIndexStats || {};
   const nStats = Object.keys(stats).length;
@@ -633,63 +739,214 @@ function scoreSpSummary(summary) {
   return nStats * 100 + ind.length;
 }
 
-function pickRicherSpSummary(wbA, wbB) {
-  parseSummary(wbA);
-  const sA = JSON.parse(JSON.stringify(STATE.summary));
-  parseSummary(wbB);
-  const sB = JSON.parse(JSON.stringify(STATE.summary));
-  STATE.summary = scoreSpSummary(sA) >= scoreSpSummary(sB) ? sA : sB;
+function emptySpSummary() {
+  return {
+    flowBreakdown: [],
+    twoWayTotal: 0,
+    beforeCrossing: 0,
+    crossingFlow: 0,
+    afterCrossing: 0,
+    industryNetFlows: [],
+    industryTwoWayFlows: [],
+    spIndexStats: {}
+  };
 }
 
-function pickRicherTopNames(wbA, wbB) {
-  parseTopNames(wbA);
-  const tA = JSON.parse(JSON.stringify(STATE.topNames));
-  const countA = ['illiquidBuys', 'illiquidSells', 'largestBuys', 'largestSells'].reduce((n, k) => n + (tA[k] || []).length, 0);
-  parseTopNames(wbB);
-  const tB = JSON.parse(JSON.stringify(STATE.topNames));
-  const countB = ['illiquidBuys', 'illiquidSells', 'largestBuys', 'largestSells'].reduce((n, k) => n + (tB[k] || []).length, 0);
-  STATE.topNames = countA >= countB ? tA : tB;
-}
-
-function loadDualWorkbooks(wb1, wb2) {
-  const f1 = detectFormat(wb1);
-  const f2 = detectFormat(wb2);
-  if (f1 !== 'sp' || f2 !== 'sp') {
-    alert('Dual upload is for two S&P-format workbooks (net flows + share-change). For MSCI, use one file.');
-    return false;
+function spEnrichFromChangeMap(flowRows, byTicker) {
+  for (const row of flowRows) {
+    const k = row.cleanTicker.toUpperCase();
+    const src = byTicker.get(k) || (row.cusip && byTicker.get('_' + row.cusip));
+    if (!src) continue;
+    if (src.eventType) row.eventType = src.eventType;
+    if (!row.index && src.index) row.index = src.index;
+    if (!row.cusip && src.cusip) row.cusip = src.cusip;
   }
+}
 
+function pickBestSpSummaryFromMany(wbs) {
+  let best = null;
+  let bestScore = -1;
   STATE.format = 'sp';
-  STATE.mergeNote = '';
+  for (const wb of wbs) {
+    const sn = wb.SheetNames.find(n => n.toLowerCase().includes('summary'));
+    if (!sn) continue;
+    parseSummary(wb);
+    const s = JSON.parse(JSON.stringify(STATE.summary));
+    const sc = scoreSpSummary(s);
+    if (sc > bestScore) {
+      bestScore = sc;
+      best = s;
+    }
+  }
+  STATE.summary = best || emptySpSummary();
+}
 
-  const b1 = spOverallBundleFromWorkbook(wb1);
-  const b2 = spOverallBundleFromWorkbook(wb2);
+function dedupeTopMoversByTicker(rows) {
+  const m = new Map();
+  for (const r of rows) {
+    const t = safeStr(r.ticker).toUpperCase();
+    if (!t || t.startsWith('S&P')) continue;
+    const prev = m.get(t);
+    if (!prev || Math.abs(pn(r.tradeValue)) > Math.abs(pn(prev.tradeValue))) m.set(t, r);
+  }
+  return Array.from(m.values());
+}
 
-  let flows;
-  let change;
-  if (b1.variant === 'netflows' && b2.variant === 'standard') {
-    flows = b1;
-    change = b2;
-    STATE.mergeNote = 'Net-flows list (larger universe) plus share-change file: events, index, and CUSIP filled in by ticker match.';
-  } else if (b2.variant === 'netflows' && b1.variant === 'standard') {
-    flows = b2;
-    change = b1;
-    STATE.mergeNote = 'Net-flows list (larger universe) plus share-change file: events, index, and CUSIP filled in by ticker match.';
-  } else if (b1.variant === 'standard' && b2.variant === 'standard') {
-    const larger = b1.overall.length >= b2.overall.length ? b1 : b2;
-    const smaller = larger === b1 ? b2 : b1;
-    flows = larger;
-    change = smaller;
-    STATE.mergeNote = 'Both files use the share-change layout; events from the smaller file applied where tickers match.';
-  } else {
-    flows = b1.overall.length >= b2.overall.length ? b1 : b2;
-    change = flows === b1 ? b2 : b1;
-    STATE.mergeNote = 'Both files look like net-flows exports (no CHANGE column); using the larger name list. Add the share-change XLSX for additions/deletions.';
+function mergeTopNamesFromManyWorkbooks(wbs, format) {
+  const keys = ['illiquidBuys', 'illiquidSells', 'largestBuys', 'largestSells'];
+  const merged = { illiquidBuys: [], illiquidSells: [], largestBuys: [], largestSells: [] };
+  for (const wb of wbs) {
+    STATE.format = format;
+    STATE.topNames = { illiquidBuys: [], illiquidSells: [], largestBuys: [], largestSells: [] };
+    parseTopNames(wb);
+    for (const k of keys) {
+      merged[k].push(...(STATE.topNames[k] || []).map(x => ({ ...x })));
+    }
+  }
+  for (const k of keys) {
+    merged[k] = dedupeTopMoversByTicker(merged[k]);
+    merged[k].sort((a, b) => Math.abs(pn(b.tradeValue)) - Math.abs(pn(a.tradeValue)));
+  }
+  STATE.topNames = merged;
+}
+
+function mergeSummariesMSCI(list) {
+  if (!list.length) return emptyMsciSummary();
+  const out = emptyMsciSummary();
+  for (const s of list) {
+    out.twoWayTotal = Math.max(out.twoWayTotal, s.twoWayTotal || 0);
+    out.beforeCrossing = Math.max(out.beforeCrossing, s.beforeCrossing || 0);
+    out.crossingFlow = Math.max(out.crossingFlow, s.crossingFlow || 0);
+    out.afterCrossing = Math.max(out.afterCrossing, s.afterCrossing || 0);
+  }
+  const fbMap = new Map();
+  for (const s of list) {
+    for (const b of (s.flowBreakdown || [])) {
+      const prev = fbMap.get(b.name);
+      if (!prev) fbMap.set(b.name, { name: b.name, value: b.value, pct: b.pct || 0 });
+      else fbMap.set(b.name, { name: b.name, value: prev.value + b.value, pct: b.pct || prev.pct });
+    }
+  }
+  out.flowBreakdown = Array.from(fbMap.values());
+
+  function mergeInd(key) {
+    const m = new Map();
+    for (const s of list) {
+      for (const item of (s[key] || [])) {
+        const prev = m.get(item.name) || 0;
+        m.set(item.name, prev + (item.value || 0));
+      }
+    }
+    return Array.from(m.entries()).map(([name, value]) => ({ name, value }));
+  }
+  out.industryNetFlows = mergeInd('industryNetFlows');
+  out.industryTwoWayFlows = mergeInd('industryTwoWayFlows');
+
+  if (out.beforeCrossing === 0 && out.twoWayTotal !== 0) out.beforeCrossing = out.twoWayTotal;
+  return out;
+}
+
+/** Merge any number of S&P workbooks: union Overall by ticker (later file wins), enrich from share-change rows. */
+function loadManySpWorkbooks(wbs) {
+  STATE.format = 'sp';
+  const bundles = wbs.map(spOverallBundleFromWorkbook);
+  const nets = bundles.filter(b => b.variant === 'netflows');
+  const tsx = bundles.filter(b => b.variant === 'tsx');
+  const stds = bundles.filter(b => b.variant === 'standard');
+
+  const byTicker = new Map();
+  for (const b of stds) {
+    for (const row of b.overall) {
+      const k = row.cleanTicker.toUpperCase();
+      byTicker.set(k, row);
+      if (row.cusip) byTicker.set('_' + row.cusip, row);
+    }
   }
 
-  mergeSpDualBundles(flows, change);
-  pickRicherSpSummary(wb1, wb2);
-  pickRicherTopNames(wb1, wb2);
+  const m = new Map();
+  for (let bi = 0; bi < bundles.length; bi++) {
+    const b = bundles[bi];
+    if (b.variant !== 'standard' && b.variant !== 'netflows' && b.variant !== 'tsx') continue;
+    for (const row of b.overall) {
+      m.set(row.cleanTicker.toUpperCase(), row);
+    }
+  }
+  const flowRows = Array.from(m.values());
+
+  spEnrichFromChangeMap(flowRows, byTicker);
+
+  STATE.overall = flowRows;
+  STATE.allTickers = flowRows.map(d => ({
+    ticker: d.cleanTicker,
+    fullTicker: d.ticker,
+    issuer: d.issuer,
+    country: d.country || ''
+  }));
+
+  let title = '';
+  let eff = '';
+  for (const b of bundles) {
+    if (b.title && b.title.length > title.length) title = b.title;
+    if (b.effectiveDate) eff = b.effectiveDate;
+  }
+  STATE.title = title;
+  STATE.effectiveDate = eff;
+
+  STATE.mergeNote = `Merged ${wbs.length} S&P file(s) (${nets.length} US net-flows, ${tsx.length} S&P/TSX, ${stds.length} US share-change). Union by ticker (later file wins). US events/CUSIP applied where tickers match.`;
+
+  pickBestSpSummaryFromMany(wbs);
+  mergeTopNamesFromManyWorkbooks(wbs, 'sp');
+  return true;
+}
+
+/** Merge any number of MSCI workbooks by SEDOL; combine summaries and comparison. */
+function loadManyMsciWorkbooks(wbs) {
+  STATE.format = 'msci';
+  const bySedol = new Map();
+  STATE.effectiveDate = '';
+
+  for (const wb of wbs) {
+    const json = getOverallJson(wb);
+    const bucket = { overall: [], allTickers: [], effectiveDate: '' };
+    parseOverallMSCIToBucket(json, bucket);
+    if (bucket.effectiveDate) STATE.effectiveDate = bucket.effectiveDate;
+    for (const row of bucket.overall) {
+      bySedol.set(row.sedol.toUpperCase(), row);
+    }
+  }
+
+  STATE.overall = Array.from(bySedol.values());
+  STATE.allTickers = STATE.overall.map(d => ({
+    ticker: d.cleanTicker,
+    fullTicker: d.ticker,
+    issuer: d.issuer,
+    country: d.country || ''
+  }));
+
+  const summaries = [];
+  for (const wb of wbs) {
+    const sheetName = wb.SheetNames.find(n => n.toLowerCase().includes('summary'));
+    if (!sheetName) continue;
+    const json = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, defval: '' });
+    const s = emptyMsciSummary();
+    parseSummaryMSCIInto(json, s);
+    summaries.push(s);
+  }
+  STATE.summary = summaries.length ? mergeSummariesMSCI(summaries) : emptyMsciSummary();
+
+  mergeTopNamesFromManyWorkbooks(wbs, 'msci');
+
+  const compMap = new Map();
+  for (const wb of wbs) {
+    for (const row of parseComparisonToArray(wb)) {
+      compMap.set(row.sedol.toUpperCase(), row);
+    }
+  }
+  STATE.comparison = Array.from(compMap.values());
+
+  STATE.mergeNote = `Merged ${wbs.length} MSCI workbook(s). Rows keyed by SEDOL (later file overrides duplicates). Summary: max totals per file; industry flows summed by name. Comparison merged by SEDOL.`;
+
+  enrichEventTypes();
   return true;
 }
 
@@ -709,8 +966,8 @@ function parseSummary(wb) {
   }
 }
 
-function parseSummaryMSCI(json) {
-  STATE.summary = {
+function emptyMsciSummary() {
+  return {
     flowBreakdown: [],
     twoWayTotal: 0,
     beforeCrossing: 0,
@@ -719,6 +976,10 @@ function parseSummaryMSCI(json) {
     industryNetFlows: [],
     industryTwoWayFlows: []
   };
+}
+
+function parseSummaryMSCIInto(json, s) {
+  Object.assign(s, emptyMsciSummary());
 
   for (let i = 0; i < json.length; i++) {
     const row = json[i];
@@ -726,30 +987,29 @@ function parseSummaryMSCI(json) {
 
     if (label && (label.includes('Two Way Total') || label.includes('Two-Way Total') || label.includes('2 Way Total'))) {
       for (let c = 1; c < row.length; c++) {
-        if (pn(row[c]) !== 0) { STATE.summary.twoWayTotal = pn(row[c]); break; }
+        if (pn(row[c]) !== 0) { s.twoWayTotal = pn(row[c]); break; }
       }
     }
 
     if (label && label.includes('Before Crossing') && !label.includes('Total')) {
       for (let c = 1; c < row.length; c++) {
-        if (pn(row[c]) !== 0) { STATE.summary.beforeCrossing = pn(row[c]); break; }
+        if (pn(row[c]) !== 0) { s.beforeCrossing = pn(row[c]); break; }
       }
     }
 
     if (label && (label.includes('Crossing Flow') || label.includes('Crossing Est'))) {
       for (let c = 1; c < row.length; c++) {
-        if (pn(row[c]) !== 0) { STATE.summary.crossingFlow = pn(row[c]); break; }
+        if (pn(row[c]) !== 0) { s.crossingFlow = pn(row[c]); break; }
       }
     }
 
     if (label && label.includes('After Crossing')) {
       for (let c = 1; c < row.length; c++) {
-        if (pn(row[c]) !== 0) { STATE.summary.afterCrossing = pn(row[c]); break; }
+        if (pn(row[c]) !== 0) { s.afterCrossing = pn(row[c]); break; }
       }
     }
   }
 
-  // Parse index type breakdown (DM, EM, etc.)
   const indexTypes = ['DM', 'EM', 'DM Small Cap', 'EM Small Cap', 'Min Volatility', 'Minimum Volatility',
     'Momentum', 'Quality', 'High Yield', 'High Div', 'Enhanced Value', 'ESG'];
 
@@ -766,14 +1026,13 @@ function parseSummaryMSCI(json) {
           else if (v !== 0 && pct === 0 && val !== 0) pct = v;
         }
         if (val !== 0) {
-          STATE.summary.flowBreakdown.push({ name: idx.replace('Minimum Volatility', 'Min Volatility'), value: val, pct: pct });
+          s.flowBreakdown.push({ name: idx.replace('Minimum Volatility', 'Min Volatility'), value: val, pct: pct });
         }
         break;
       }
     }
   }
 
-  // Parse Industry Net Flows and Two-Way Flows
   let inNetFlows = false, inTwoWayFlows = false;
   for (let i = 0; i < json.length; i++) {
     const row = json[i];
@@ -792,7 +1051,7 @@ function parseSummaryMSCI(json) {
         if (pn(row[c]) !== 0) { val = pn(row[c]); break; }
       }
       if (val !== 0) {
-        STATE.summary.industryNetFlows.push({ name: label, value: val });
+        s.industryNetFlows.push({ name: label, value: val });
       }
     }
 
@@ -802,27 +1061,23 @@ function parseSummaryMSCI(json) {
         if (pn(row[c]) !== 0) { val = pn(row[c]); break; }
       }
       if (val !== 0) {
-        STATE.summary.industryTwoWayFlows.push({ name: label, value: val });
+        s.industryTwoWayFlows.push({ name: label, value: val });
       }
     }
   }
 
-  if (STATE.summary.beforeCrossing === 0 && STATE.summary.twoWayTotal !== 0) {
-    STATE.summary.beforeCrossing = STATE.summary.twoWayTotal;
+  if (s.beforeCrossing === 0 && s.twoWayTotal !== 0) {
+    s.beforeCrossing = s.twoWayTotal;
   }
 }
 
+function parseSummaryMSCI(json) {
+  STATE.summary = emptyMsciSummary();
+  parseSummaryMSCIInto(json, STATE.summary);
+}
+
 function parseSummarySP(json) {
-  STATE.summary = {
-    flowBreakdown: [],       // Will hold S&P index buy/sell stats
-    twoWayTotal: 0,
-    beforeCrossing: 0,
-    crossingFlow: 0,
-    afterCrossing: 0,
-    industryNetFlows: [],
-    industryTwoWayFlows: [],
-    spIndexStats: {}         // S&P specific: per-index buy/sell/total stats
-  };
+  STATE.summary = emptySpSummary();
 
   // S&P Summary: Industry net flows from rows 9+ (col B=industry, C=S&P500, D=S&P400, E=S&P600, F=NET TOTAL)
   // Look for the "Industry Group" header row
@@ -1031,9 +1286,9 @@ function parseTopNamesSP(json) {
 // ============================================================
 // PARSE COMPARISON SHEET (MSCI only)
 // ============================================================
-function parseComparison(wb) {
+function parseComparisonToArray(wb) {
   const sheetName = wb.SheetNames.find(n => n.toLowerCase().includes('compar'));
-  if (!sheetName) return;
+  if (!sheetName) return [];
   const ws = wb.Sheets[sheetName];
   const json = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
 
@@ -1074,14 +1329,14 @@ function parseComparison(wb) {
   }
 
   const d = dataStartCol;
+  const out = [];
 
-  STATE.comparison = [];
   for (let i = headerIdx + 1; i < json.length; i++) {
     const row = json[i];
     const sedol = safeStr(row[colMap.sedol]);
     if (!sedol) continue;
 
-    const item = {
+    out.push({
       sedol,
       ticker: safeStr(row[colMap.ticker]),
       issuer: safeStr(row[colMap.issuer]),
@@ -1092,10 +1347,14 @@ function parseComparison(wb) {
       netFull: { shares: pn(row[d+1]), value: pn(row[d+3]), liq: pn(row[d+5]) },
       grossStandard: { shares: pn(row[d+6]), value: pn(row[d+8]), liq: pn(row[d+10]) },
       grossFull: { shares: pn(row[d+7]), value: pn(row[d+9]), liq: pn(row[d+11]) }
-    };
-
-    STATE.comparison.push(item);
+    });
   }
+
+  return out;
+}
+
+function parseComparison(wb) {
+  STATE.comparison = parseComparisonToArray(wb);
 }
 
 // ============================================================
@@ -1132,7 +1391,7 @@ function initDashboard() {
   // Update comparison nav item
   const compNavItem = document.querySelector('.sidebar-nav a[data-tab="comparison"]');
   if (STATE.format === 'sp') {
-    compNavItem.innerHTML = '<span class="nav-icon">&#8644;</span> Index Breakdown';
+    compNavItem.innerHTML = '<span class="nav-icon">&#8644;</span> Index Summary';
   } else {
     compNavItem.innerHTML = '<span class="nav-icon">&#8644;</span> Comparison';
   }
@@ -1238,6 +1497,7 @@ function renderOverview() {
         <div class="banner-label">Two-Way Flow (Before Crossing)</div>
         <div class="banner-value">${summary.beforeCrossing ? '$' + fmt(summary.beforeCrossing, 0) + ' MM' : fmtMM(buys.reduce((s,d)=>s+Math.abs(d.grossValue),0) + sells.reduce((s,d)=>s+Math.abs(d.grossValue),0))}</div>
       </div>
+      ${STATE.mergeNote ? `<div class="banner-merge-note">${STATE.mergeNote}</div>` : ''}
     `;
   }
 
@@ -1304,61 +1564,38 @@ function renderFlowBreakdown() {
   const titleEl = body.closest('.section-card').querySelector('.section-title');
 
   if (STATE.format === 'sp') {
-    titleEl.textContent = 'S&P Index Buy/Sell Stats';
-    const stats = STATE.summary.spIndexStats || {};
-    const indices = Object.keys(stats);
-    if (indices.length === 0) {
-      // Compute from overall data
-      const byIndex = {};
-      STATE.overall.forEach(d => {
-        if (!d.index) return;
-        if (!byIndex[d.index]) byIndex[d.index] = { buys: 0, sells: 0, buyVal: 0, sellVal: 0 };
-        if (d.direction === 'BUY') {
-          byIndex[d.index].buys++;
-          byIndex[d.index].buyVal += d.netValue;
-        } else {
-          byIndex[d.index].sells++;
-          byIndex[d.index].sellVal += Math.abs(d.netValue);
-        }
-      });
-      body.innerHTML = `
-        <table class="flow-table">
-          <thead><tr><th>Index</th><th class="num-cell">Buys</th><th class="num-cell">Sells</th><th class="num-cell">Net Buy Value ($MM)</th><th class="num-cell">Net Sell Value ($MM)</th></tr></thead>
-          <tbody>
-            ${Object.entries(byIndex).map(([idx, v]) => `
+    titleEl.textContent = 'Buy / Sell by Index';
+    const byIndex = aggregateSpOverallByIndex(STATE.overall);
+    const keys = Object.keys(byIndex).sort((a, b) => {
+      const ta = Math.abs(byIndex[a].buyVal) + Math.abs(byIndex[a].sellVal);
+      const tb = Math.abs(byIndex[b].buyVal) + Math.abs(byIndex[b].sellVal);
+      return tb - ta;
+    });
+    if (!keys.length) {
+      body.innerHTML = '<p style="color:var(--text-muted);">No index data on loaded names.</p>';
+      return;
+    }
+    body.innerHTML = `
+      <table class="flow-table">
+        <thead><tr><th>Index</th><th class="num-cell">Buys (names)</th><th class="num-cell">Sells (names)</th><th class="num-cell">Net buy value</th><th class="num-cell">Net sell value</th><th class="num-cell">Net total</th></tr></thead>
+        <tbody>
+          ${keys.map(idx => {
+            const v = byIndex[idx];
+            const netTot = v.buyVal - v.sellVal;
+            return `
               <tr>
                 <td style="color:var(--text-primary)">${idx}</td>
-                <td class="num-cell green-text">${v.buys}</td>
-                <td class="num-cell red-text">${v.sells}</td>
+                <td class="num-cell green-text">${fmt(v.buys, 1)}</td>
+                <td class="num-cell red-text">${fmt(v.sells, 1)}</td>
                 <td class="num-cell green-text">${fmtMM(v.buyVal)}</td>
                 <td class="num-cell red-text">${fmtMM(v.sellVal)}</td>
+                <td class="num-cell ${dirClass(netTot)}">${fmtMM(netTot)}</td>
               </tr>
-            `).join('')}
-          </tbody>
-        </table>
-      `;
-    } else {
-      body.innerHTML = `
-        <table class="flow-table">
-          <thead><tr><th>Index</th><th class="num-cell">Buys</th><th class="num-cell">Buy Value ($MM)</th><th class="num-cell">Sells</th><th class="num-cell">Sell Value ($MM)</th><th class="num-cell">Total</th></tr></thead>
-          <tbody>
-            ${indices.map(idx => {
-              const s = stats[idx];
-              return `
-                <tr>
-                  <td style="color:var(--text-primary)">${idx}</td>
-                  <td class="num-cell green-text">${s.buys ? fmtInt(s.buys.count) : '\u2014'}</td>
-                  <td class="num-cell green-text">${s.buys ? fmtMM(s.buys.value) : '\u2014'}</td>
-                  <td class="num-cell red-text">${s.sells ? fmtInt(s.sells.count) : '\u2014'}</td>
-                  <td class="num-cell red-text">${s.sells ? fmtMM(s.sells.value) : '\u2014'}</td>
-                  <td class="num-cell">${s.total ? fmtInt(s.total.count) : '\u2014'}</td>
-                </tr>
-              `;
-            }).join('')}
-          </tbody>
-        </table>
-      `;
-    }
+            `;
+          }).join('')}
+        </tbody>
+      </table>
+    `;
     return;
   }
 
@@ -1472,16 +1709,12 @@ function renderIndustryTwoWayChart() {
 }
 
 function renderIndexDistributionChart() {
-  // S&P: Show a bar chart of names per index
-  const byIndex = {};
-  STATE.overall.forEach(d => {
-    if (!d.index) return;
-    if (!byIndex[d.index]) byIndex[d.index] = { buys: 0, sells: 0 };
-    if (d.direction === 'BUY') byIndex[d.index].buys++;
-    else byIndex[d.index].sells++;
-  });
-
+  const byIndex = aggregateSpOverallByIndex(STATE.overall);
   const indices = Object.keys(byIndex).sort();
+  if (!indices.length) {
+    destroyChart('industryTwoWay');
+    return;
+  }
   const buyData = indices.map(i => byIndex[i].buys);
   const sellData = indices.map(i => byIndex[i].sells);
 
@@ -1513,7 +1746,7 @@ function renderIndexDistributionChart() {
       maintainAspectRatio: false,
       plugins: {
         legend: { labels: { color: '#8888a0', font: { family: 'DM Sans', size: 11 } } },
-        tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${ctx.raw} names` } }
+        tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${fmt(ctx.raw, 2)} names` } }
       },
       scales: {
         x: { grid: { color: '#1e1e30' }, ticks: { color: '#e8e8f0', font: { family: 'DM Sans', size: 11 } } },
@@ -1573,8 +1806,12 @@ function renderCountryDonut() {
 function renderIndexDonut() {
   const byIndex = {};
   STATE.overall.forEach(d => {
-    if (!d.index) return;
-    byIndex[d.index] = (byIndex[d.index] || 0) + 1;
+    const parts = splitIndexTokens(d.index);
+    const keys = parts.length ? parts : ['(no index)'];
+    const n = keys.length;
+    keys.forEach(k => {
+      byIndex[k] = (byIndex[k] || 0) + 1 / n;
+    });
   });
 
   const sorted = Object.entries(byIndex).sort((a, b) => b[1] - a[1]);
@@ -1599,7 +1836,7 @@ function renderIndexDonut() {
         legend: { display: false },
         tooltip: {
           callbacks: {
-            label: ctx => `${ctx.label}: ${ctx.raw} names (${((ctx.raw / STATE.overall.length) * 100).toFixed(1)}%)`
+            label: ctx => `${ctx.label}: ${fmt(ctx.raw, 2)} name-weight (${STATE.overall.length ? ((ctx.raw / STATE.overall.length) * 100).toFixed(1) : 0}% of rows)`
           }
         }
       }
@@ -1611,7 +1848,7 @@ function renderIndexDonut() {
     <div class="legend-item">
       <div class="legend-dot" style="background:${colors[i]}"></div>
       <span class="legend-label">${s[0]}</span>
-      <span class="legend-count">${s[1]}</span>
+      <span class="legend-count">${fmt(s[1], 1)}</span>
     </div>
   `).join('');
 }
@@ -1637,22 +1874,32 @@ function generateColors(n) {
 function renderAllNames() {
   const filters = document.getElementById('allnames-filters');
   const cols = getAllNamesCols();
+  const evOpts = buildEventFilterOptions(STATE.overall);
 
   if (STATE.format === 'sp') {
-    // Build unique indices and industries
     const indices = [...new Set(STATE.overall.map(d => d.index).filter(Boolean))].sort();
     const industries = [...new Set(STATE.overall.map(d => d.industry).filter(Boolean))].sort();
+    const countries = [...new Set(STATE.overall.map(d => d.country).filter(Boolean))].sort();
 
     filters.innerHTML = `
       <input type="text" class="filter-input" id="an-search" placeholder="Search ticker or name...">
-      <select class="filter-select" id="an-index">
-        <option value="all">All Indices</option>
-        ${indices.map(i => `<option value="${i}">${i}</option>`).join('')}
+      <select class="filter-select filter-select--wide" id="an-event" title="Event / change type">
+        <option value="all">All events</option>
+        ${evOpts}
       </select>
-      <select class="filter-select" id="an-industry">
-        <option value="all">All Industries</option>
-        ${industries.map(i => `<option value="${i}">${i}</option>`).join('')}
+      <select class="filter-select filter-select--wide" id="an-index">
+        <option value="all">All indices</option>
+        ${indices.map(i => `<option value="${escapeAttr(i)}">${escapeAttr(i)}</option>`).join('')}
       </select>
+      <select class="filter-select filter-select--wide" id="an-industry">
+        <option value="all">All industries</option>
+        ${industries.map(i => `<option value="${escapeAttr(i)}">${escapeAttr(i)}</option>`).join('')}
+      </select>
+      ${countries.length ? `
+      <select class="filter-select" id="an-country">
+        <option value="all">All countries</option>
+        ${countries.map(c => `<option value="${escapeAttr(c)}">${escapeAttr(c)}</option>`).join('')}
+      </select>` : ''}
       <button class="filter-btn" id="an-buy" data-dir="BUY">Buys</button>
       <button class="filter-btn" id="an-sell" data-dir="SELL">Sells</button>
       <button class="filter-btn active" id="an-all" data-dir="all">All</button>
@@ -1664,20 +1911,43 @@ function renderAllNames() {
       STATE.allNamesPage = 1;
       renderAllNamesTable();
     });
+    document.getElementById('an-event').addEventListener('change', e => {
+      STATE.allNamesFilter.event = e.target.value;
+      STATE.allNamesPage = 1;
+      renderAllNamesTable();
+    });
+    const anCountry = document.getElementById('an-country');
+    if (anCountry) {
+      anCountry.addEventListener('change', e => {
+        STATE.allNamesFilter.country = e.target.value;
+        STATE.allNamesPage = 1;
+        renderAllNamesTable();
+      });
+    }
   } else {
     const countries = [...new Set(STATE.overall.map(d => d.country).filter(Boolean))].sort();
     const industries = [...new Set(STATE.overall.map(d => d.industry).filter(Boolean))].sort();
+    const indices = [...new Set(STATE.overall.map(d => d.index).filter(Boolean))].sort();
 
     filters.innerHTML = `
       <input type="text" class="filter-input" id="an-search" placeholder="Search ticker or issuer...">
+      <select class="filter-select filter-select--wide" id="an-event" title="Event">
+        <option value="all">All events</option>
+        ${evOpts}
+      </select>
       <select class="filter-select" id="an-country">
-        <option value="all">All Countries</option>
-        ${countries.map(c => `<option value="${c}">${c}</option>`).join('')}
+        <option value="all">All countries</option>
+        ${countries.map(c => `<option value="${escapeAttr(c)}">${escapeAttr(c)}</option>`).join('')}
       </select>
-      <select class="filter-select" id="an-industry">
-        <option value="all">All Industries</option>
-        ${industries.map(i => `<option value="${i}">${i}</option>`).join('')}
+      <select class="filter-select filter-select--wide" id="an-industry">
+        <option value="all">All industries</option>
+        ${industries.map(i => `<option value="${escapeAttr(i)}">${escapeAttr(i)}</option>`).join('')}
       </select>
+      ${indices.length ? `
+      <select class="filter-select filter-select--wide" id="an-index">
+        <option value="all">All indices</option>
+        ${indices.map(i => `<option value="${escapeAttr(i)}">${escapeAttr(i)}</option>`).join('')}
+      </select>` : ''}
       <button class="filter-btn" id="an-buy" data-dir="BUY">Buys</button>
       <button class="filter-btn" id="an-sell" data-dir="SELL">Sells</button>
       <button class="filter-btn active" id="an-all" data-dir="all">All</button>
@@ -1689,6 +1959,19 @@ function renderAllNames() {
       STATE.allNamesPage = 1;
       renderAllNamesTable();
     });
+    document.getElementById('an-event').addEventListener('change', e => {
+      STATE.allNamesFilter.event = e.target.value;
+      STATE.allNamesPage = 1;
+      renderAllNamesTable();
+    });
+    const anIdx = document.getElementById('an-index');
+    if (anIdx) {
+      anIdx.addEventListener('change', e => {
+        STATE.allNamesFilter.index = e.target.value;
+        STATE.allNamesPage = 1;
+        renderAllNamesTable();
+      });
+    }
   }
 
   // Headers
@@ -1756,7 +2039,17 @@ function getFilteredAllNames() {
   if (f.country !== 'all') data = data.filter(d => d.country === f.country);
   if (f.industry !== 'all') data = data.filter(d => d.industry === f.industry);
   if (f.direction !== 'all') data = data.filter(d => d.direction === f.direction);
-  if (f.index !== 'all') data = data.filter(d => d.index === f.index);
+  if (f.event !== 'all') {
+    if (f.event === '__none__') data = data.filter(d => !d.eventType);
+    else data = data.filter(d => (d.eventType || '') === f.event);
+  }
+  if (f.index !== 'all') {
+    data = data.filter(d => {
+      const raw = (d.index || '').trim();
+      const parts = splitIndexTokens(d.index);
+      return parts.includes(f.index) || raw === f.index;
+    });
+  }
 
   const s = STATE.allNamesSort;
   if (s.col) {
@@ -2004,126 +2297,52 @@ function renderComparisonMSCI() {
 }
 
 function renderComparisonSP() {
-  // S&P: Show INDEX x CHANGE breakdown
   const filters = document.getElementById('comparison-filters');
-  filters.innerHTML = `
-    <input type="text" class="filter-input" id="comp-search" placeholder="Search ticker or name...">
-    <button class="filter-btn active" id="comp-all" data-dir="all">All</button>
-    <button class="filter-btn" id="comp-additions" data-dir="additions">Additions</button>
-    <button class="filter-btn" id="comp-deletions" data-dir="deletions">Deletions</button>
-  `;
+  filters.innerHTML = '<p class="comparison-hint">Aggregate buy/sell activity by index (same methodology as Overview). Row-level filtering—including <strong>event</strong>, <strong>index</strong>, <strong>industry</strong>, and <strong>country</strong>—is on the <strong>All Names</strong> tab.</p>';
+
+  const pageTitle = document.querySelector('#tab-comparison .page-title');
+  if (pageTitle) pageTitle.textContent = 'Index Summary';
+  const pageBadge = document.querySelector('#tab-comparison .page-badge');
+  if (pageBadge) pageBadge.textContent = 'AGGREGATE';
 
   const thead = document.getElementById('comparison-thead');
   thead.innerHTML = `<tr>
-    <th data-col="cleanTicker">Ticker</th>
-    <th data-col="issuer">Name</th>
-    <th data-col="index">Index</th>
-    <th data-col="eventType">Change Type</th>
-    <th class="num-cell" data-col="price">Price</th>
-    <th class="num-cell" data-col="netValue">Net Value ($MM)</th>
-    <th class="num-cell" data-col="netShares">Net Shares</th>
-    <th class="num-cell" data-col="netLiq">Liquidity %</th>
+    <th>Index</th>
+    <th class="num-cell">Buys (names)</th>
+    <th class="num-cell">Sells (names)</th>
+    <th class="num-cell">Net buy value</th>
+    <th class="num-cell">Net sell value</th>
+    <th class="num-cell">Net total</th>
   </tr>`;
 
-  // Update page header
-  const pageTitle = document.querySelector('#tab-comparison .page-title');
-  if (pageTitle) pageTitle.textContent = 'Index Breakdown';
-  const pageBadge = document.querySelector('#tab-comparison .page-badge');
-  if (pageBadge) pageBadge.textContent = 'BY INDEX & CHANGE TYPE';
-
-  document.getElementById('comp-search').addEventListener('input', e => {
-    STATE.compFilter.search = e.target.value.toLowerCase();
-    STATE.compPage = 1;
-    renderComparisonTableSP();
+  const byIndex = aggregateSpOverallByIndex(STATE.overall);
+  const keys = Object.keys(byIndex).sort((a, b) => {
+    const net = (x) => byIndex[x].buyVal - byIndex[x].sellVal;
+    return Math.abs(net(b)) - Math.abs(net(a));
   });
-
-  ['comp-all', 'comp-additions', 'comp-deletions'].forEach(id => {
-    document.getElementById(id).addEventListener('click', e => {
-      ['comp-all', 'comp-additions', 'comp-deletions'].forEach(bid => document.getElementById(bid).classList.remove('active'));
-      e.target.classList.add('active');
-      STATE.compFilter.direction = e.target.dataset.dir;
-      STATE.compPage = 1;
-      renderComparisonTableSP();
-    });
-  });
-
-  thead.querySelectorAll('th').forEach(th => {
-    th.addEventListener('click', () => {
-      const col = th.dataset.col;
-      if (STATE.compSort.col === col) {
-        STATE.compSort.dir = STATE.compSort.dir === 'asc' ? 'desc' : 'asc';
-      } else {
-        STATE.compSort.col = col;
-        STATE.compSort.dir = 'desc';
-      }
-      thead.querySelectorAll('th').forEach(t => t.classList.remove('sort-asc', 'sort-desc'));
-      th.classList.add('sort-' + STATE.compSort.dir);
-      renderComparisonTableSP();
-    });
-  });
-
-  renderComparisonTableSP();
-}
-
-function getFilteredComparisonSP() {
-  let data = [...STATE.overall];
-  const f = STATE.compFilter;
-
-  if (f.search) {
-    data = data.filter(d =>
-      d.cleanTicker.toLowerCase().includes(f.search) ||
-      d.issuer.toLowerCase().includes(f.search)
-    );
-  }
-
-  if (f.direction === 'additions') {
-    data = data.filter(d => d.eventType === 'ADDITION' || (d.eventType && d.eventType.includes('\u2192')));
-  }
-  if (f.direction === 'deletions') {
-    data = data.filter(d => d.eventType === 'DELETION');
-  }
-
-  const s = STATE.compSort;
-  if (s.col) {
-    data.sort((a, b) => {
-      let va = a[s.col], vb = b[s.col];
-      if (typeof va === 'string') va = va.toLowerCase();
-      if (typeof vb === 'string') vb = vb.toLowerCase();
-      if (va < vb) return s.dir === 'asc' ? -1 : 1;
-      if (va > vb) return s.dir === 'asc' ? 1 : -1;
-      return 0;
-    });
-  }
-
-  return data;
-}
-
-function renderComparisonTableSP() {
-  const filtered = getFilteredComparisonSP();
-  const totalPages = Math.ceil(filtered.length / PER_PAGE);
-  if (STATE.compPage > totalPages) STATE.compPage = Math.max(1, totalPages);
-
-  const start = (STATE.compPage - 1) * PER_PAGE;
-  const page = filtered.slice(start, start + PER_PAGE);
 
   const tbody = document.getElementById('comparison-tbody');
-  tbody.innerHTML = page.map(d => `
-    <tr class="${d.direction === 'BUY' ? 'row-buy' : 'row-sell'}">
-      <td><strong style="color:var(--cyan)">${d.cleanTicker}</strong></td>
-      <td>${d.issuer}</td>
-      <td>${d.index}</td>
-      <td>${eventBadge(d.eventType)}</td>
-      <td class="num-cell">${fmtPrice(d.price)}</td>
-      <td class="num-cell ${dirClass(d.netValue)}">${fmtMM(d.netValue)}</td>
-      <td class="num-cell ${dirClass(d.netShares)}">${fmtInt(d.netShares)}</td>
-      <td class="num-cell">${fmtPct(d.netLiq)}</td>
-    </tr>
-  `).join('');
+  if (!keys.length) {
+    tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);padding:1rem;">No index data on loaded names.</td></tr>';
+  } else {
+    tbody.innerHTML = keys.map(idx => {
+      const v = byIndex[idx];
+      const netTot = v.buyVal - v.sellVal;
+      return `
+        <tr>
+          <td style="color:var(--text-primary)">${idx}</td>
+          <td class="num-cell green-text">${fmt(v.buys, 1)}</td>
+          <td class="num-cell red-text">${fmt(v.sells, 1)}</td>
+          <td class="num-cell green-text">${fmtMM(v.buyVal)}</td>
+          <td class="num-cell red-text">${fmtMM(v.sellVal)}</td>
+          <td class="num-cell ${dirClass(netTot)}">${fmtMM(netTot)}</td>
+        </tr>
+      `;
+    }).join('');
+  }
 
-  renderPagination('comparison-pagination', STATE.compPage, totalPages, p => {
-    STATE.compPage = p;
-    renderComparisonTableSP();
-  });
+  const pag = document.getElementById('comparison-pagination');
+  if (pag) pag.innerHTML = '';
 }
 
 function getFilteredComparison() {
